@@ -166,10 +166,12 @@ class FlowWrapper(nn.Module):
 
         mask = h_masks.to(mu)
         x = torch.cat([initial_noise[:, :, :mel_len1], noise], dim=2)
+        speaker = embedding.unsqueeze(-1) + torch.zeros_like(x)
+        conds = torch.cat([speaker, conds], dim=1)
         for i in range(self.n_timesteps):
             t = self.t_span[i].view(1)
             r = self.t_span[i + 1].view(1)
-            dxdt = flow.decoder.estimator.forward(x, mask=mask, mu=mu, t=t, spks=embedding, cond=conds, r=r)
+            dxdt = flow.decoder.estimator.forward(x, mask=mask, mu=mu, t=t, cond=conds, r=r)
             x = x + (r - t) * dxdt
 
         return x[:, :, mel_len1:]

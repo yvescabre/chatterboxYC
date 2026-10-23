@@ -24,8 +24,8 @@ def _read_npz(name):
     return np.load(artifacts_dir() / name, allow_pickle=False)
 
 
-def _model(component, compute_units=ct.ComputeUnit.ALL):
-    path = artifacts_dir() / f"{component}_fp16.mlpackage"
+def _model(component, compute_units=ct.ComputeUnit.ALL, variant="fp16"):
+    path = artifacts_dir() / f"{component}_{variant}.mlpackage"
     return ct.models.MLModel(str(path), compute_units=compute_units)
 
 
@@ -140,7 +140,7 @@ def _write_wav(path, audio):
         wav_file.writeframes(pcm.tobytes())
 
 
-def check_references():
+def check_references(variant="fp16"):
     cases = {
         "prefix": ("t3_prefix_ref.npz", ["text_tokens", "speaker_emb", "cond_prompt_speech_tokens"], "inputs_embeds", "inputs_embeds"),
         "t3": ("t3_stateful_ref.npz", ["inputs_embeds", "position_start", "causal_mask"], "speech_logits", "speech_logits"),
@@ -159,7 +159,7 @@ def check_references():
             inputs["token"] = np.asarray(inputs["token"], dtype=np.int32)
             inputs["prompt_token"] = np.asarray(inputs["prompt_token"], dtype=np.int32)
             inputs["prompt_token_len"] = np.asarray(inputs["prompt_token_len"], dtype=np.int32)
-        package = _model(component)
+        package = _model(component, variant=variant)
         inputs = _filter_inputs(package, inputs)
         if component == "t3":
             predicted, state = _stateful_predict(package, inputs)
@@ -193,7 +193,9 @@ def check_references():
 
         latency = {}
         for label, unit in (("ALL", ct.ComputeUnit.ALL), ("CPU_ONLY", ct.ComputeUnit.CPU_ONLY)):
-            runner = package if label == "ALL" else _model(component, compute_units=unit)
+            runner = package if label == "ALL" else _model(
+                component, compute_units=unit, variant=variant
+            )
             latency[label] = _timed_predict(component, runner, inputs, repeats=5)
             print(f"[latency] {component} {label}: median={latency[label]:.6f}s (5 runs)")
             if runner is not package:
@@ -202,15 +204,15 @@ def check_references():
     return results
 
 
-def run_pipeline():
+def run_pipeline(variant="fp16"):
     out_dir = artifacts_dir()
     conds = _read_npz("conds.npz")
     speech_emb = np.load(out_dir / "speech_emb_fp16.npy", allow_pickle=False)
     tokenized = json.loads((out_dir / "tokenized_texts.json").read_text())
-    prefix_model = _model("prefix")
-    t3_model = _model("t3")
-    flow_model = _model("flow")
-    hift_model = _model("hift")
+    prefix_model = _model("prefix", variant=variant)
+    t3_model = _model("t3", variant=variant)
+    flow_model = _model("flow", variant=variant)
+    hift_model = _model("hift", variant=variant)
     rng = np.random.default_rng(0)
 
     cond_prompt = np.asarray(conds["t3_prompt_speech_tokens"], dtype=np.int32)
@@ -285,12 +287,13 @@ def run_pipeline():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--references-only", action="store_true")
+    parser.add_argument("--variant", choices=("fp16", "int8"), default="fp16")
     args = parser.parse_args()
     if hasattr(ct.utils, "_macos_version") and ct.utils._macos_version() < (15, 0):
         raise SystemExit("Core ML stateful models require macOS 15 / iOS 18.")
-    refs = check_references()
+    refs = check_references(args.variant)
     if not args.references_only:
-        run_pipeline()
+        run_pipeline(args.variant)
     print(json.dumps(refs, indent=2))
 
 
