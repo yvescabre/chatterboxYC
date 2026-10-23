@@ -61,6 +61,8 @@ attempts per-channel symmetric INT8 weight quantization with
 `ct.optimize.coreml.linear_quantize_weights` and 6-bit k-means palettization. Sizes and
 conversion errors are recorded in `conversion_status.json`. To re-run compression on
 already converted packages, use `--quantize-existing` with a component name.
+The flow conversion registers a PyTorch `view_as` converter that reshapes to the
+reference tensor's shape.
 
 Latest Linux conversion results (package sizes):
 
@@ -68,21 +70,24 @@ Latest Linux conversion results (package sizes):
 | --- | ---: | ---: | ---: |
 | T3 prefix | 83.6 MiB | 41.9 MiB | 31.4 MiB |
 | Stateful T3 | 173.6 MiB | 87.2 MiB | 65.4 MiB |
+| Flow | 229.6 MiB | 116.5 MiB | 87.7 MiB |
 | HiFT | 39.9 MiB | 20.2 MiB | 15.2 MiB |
-| Flow | blocked | — | — |
 
-Flow conversion stops at the Core ML Tools 8.3 PyTorch frontend error:
-`RuntimeError: PyTorch convert function for op 'view_as' not implemented.` No Flow
-package is available for Mac end-to-end checks yet. No Core ML prediction is attempted
-on Linux.
+All four models converted and compressed successfully. No Core ML prediction is
+attempted on Linux.
 
 ## Mac: Core ML references, timing, and audio
 
 On macOS 15 or later, install a Python environment with Core ML Tools 8.3, NumPy, and
 PyTorch 2.6.0, make the repository importable, and copy/reference the artifact directory
-created on Linux. Then run:
+created on Linux. The prepared bundle at `~/nano-spike/coreml/mac_bundle.tar.gz` contains
+all four FP16 packages, NPZ references and conditionals, the NPY speech embedding table,
+tokenized line inputs, and the parity/conversion summaries. Extract it into the directory
+used for `NANO_SPIKE_DIR`:
 
 ```bash
+mkdir -p ~/nano-spike/coreml
+tar -xzf ~/nano-spike/coreml/mac_bundle.tar.gz -C ~/nano-spike/coreml
 source ~/venvs/chatterbox/bin/activate
 export NANO_SPIKE_DIR=~/nano-spike/coreml
 python -m coreml_spike.mac_check
@@ -106,5 +111,4 @@ Core ML prediction requires macOS/iOS. The Linux pass can establish PyTorch pari
 attempt conversion, but cannot establish device correctness, latency, memory use, or
 audio quality. In particular, the stateful GPT2 cache must be validated on iOS 18 or
 later, and the full Nano model's performance on an iPad remains unknown until the Mac
-and device checks are run. Flow's unsupported `view_as` conversion op also remains an
-open blocker for the complete pipeline.
+and device checks are run.

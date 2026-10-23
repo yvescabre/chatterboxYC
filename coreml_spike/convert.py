@@ -8,6 +8,9 @@ import traceback
 import coremltools as ct
 import numpy as np
 import torch
+from coremltools.converters.mil import Builder as mb
+from coremltools.converters.mil.frontend.torch.ops import _get_inputs
+from coremltools.converters.mil.frontend.torch.torch_op_registry import register_torch_op
 from coremltools.optimize.coreml._config import CompressionGranularity
 
 from coreml_spike.common import (
@@ -22,6 +25,12 @@ from coreml_spike.common import (
     load_nano,
 )
 from coreml_spike.wrappers import FlowWrapper, HiFTWrapper, T3Prefix, T3Stateful
+
+
+@register_torch_op
+def view_as(context, node):
+    x, other = _get_inputs(context, node, expected=2)
+    context.add(mb.reshape(x=x, shape=mb.shape(x=other), name=node.name))
 
 
 def _tensor(name, shape, dtype=None):
