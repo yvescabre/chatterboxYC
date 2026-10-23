@@ -33,9 +33,11 @@ class T3Prefix(nn.Module):
 
     def forward(self, text_tokens, speaker_emb, cond_prompt_speech_tokens):
         speaker = self.spkr_enc(speaker_emb.reshape(-1, self.spkr_enc.in_features))[:, None, :]
-        prompt = self.speech_emb(cond_prompt_speech_tokens.long())
-        text = self.text_emb(text_tokens.long())
-        start_token = torch.ones_like(text_tokens[:, :1]) * self.start_speech_token
+        prompt = self.speech_emb(cond_prompt_speech_tokens)
+        text = self.text_emb(text_tokens)
+        start_token = torch.tensor(
+            [[self.start_speech_token]], dtype=torch.int32, device=text_tokens.device
+        )
         start = self.speech_emb(start_token)
         return torch.cat([speaker, prompt, text, start], dim=1)
 

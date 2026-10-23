@@ -51,9 +51,9 @@ def _convert_component(component, out_dir, fixed_speech_length=None):
             _tensor("cond_prompt_speech_tokens", (1, 375), np.int32),
         ]
         example_inputs = (
-            torch.ones((1, 16), dtype=torch.long),
+            torch.ones((1, 16), dtype=torch.int32),
             model.conds.t3.speaker_emb,
-            model.conds.t3.cond_prompt_speech_tokens,
+            model.conds.t3.cond_prompt_speech_tokens.to(torch.int32),
         )
         states = None
         output_type = _tensor("inputs_embeds", None)
@@ -186,6 +186,10 @@ def _convert_component(component, out_dir, fixed_speech_length=None):
         raise ValueError(component)
 
     torch_model = torch.jit.trace(module, example_inputs, strict=False)
+    pass_pipeline = None
+    if component == "prefix":
+        pass_pipeline = ct.PassPipeline(list(ct.PassPipeline.DEFAULT.passes))
+        pass_pipeline.remove_passes({"common::add_int16_cast"})
     converted = ct.convert(
         torch_model,
         source="pytorch",
@@ -195,6 +199,7 @@ def _convert_component(component, out_dir, fixed_speech_length=None):
         convert_to="mlprogram",
         minimum_deployment_target=ct.target.iOS18,
         compute_precision=ct.precision.FLOAT16,
+        pass_pipeline=pass_pipeline,
     )
     suffix = f"_{fixed_speech_length}" if fixed_speech_length is not None else ""
     fp16_path = out_dir / f"{component}{suffix}_fp16.mlpackage"

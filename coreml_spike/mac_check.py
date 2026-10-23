@@ -244,6 +244,36 @@ def check_references(variant="fp16"):
                 actual = actual[:, : refs[expected_name].shape[-1]]
             error = max_abs_err(actual, refs[expected_name])
             results[component] = {"max_abs_error": error}
+            if component == "prefix":
+                difference = np.abs(actual - refs[expected_name])[0]
+                elements_per_position = np.count_nonzero(difference > 1e-2, axis=1)
+                mismatched_positions = np.flatnonzero(elements_per_position).tolist()
+                prompt_end = inputs["cond_prompt_speech_tokens"].shape[1]
+                text_end = prompt_end + inputs["text_tokens"].shape[1]
+
+                def row_name(position):
+                    if position == 0:
+                        return "speaker"
+                    if position <= prompt_end:
+                        return "prompt"
+                    if position <= text_end:
+                        return "text"
+                    return "start_speech"
+
+                mismatch_rows = sorted({row_name(position) for position in mismatched_positions})
+                results[component]["mismatch_threshold"] = 1e-2
+                results[component]["mismatch_rows"] = mismatch_rows
+                results[component]["mismatched_positions"] = [
+                    {
+                        "position": position,
+                        "elements": int(elements_per_position[position]),
+                    }
+                    for position in mismatched_positions
+                ]
+                print(
+                    f"[prefix-mismatch] threshold=1e-2 rows={mismatch_rows} "
+                    f"positions={results[component]['mismatched_positions']}"
+                )
         print(f"[reference] {component}: max_abs_error={error:.9g}")
 
         latency = {}
