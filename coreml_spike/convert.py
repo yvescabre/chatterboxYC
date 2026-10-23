@@ -37,7 +37,7 @@ def _tensor(name, shape, dtype=None):
     return ct.TensorType(name=name, shape=shape, dtype=dtype)
 
 
-def _convert_component(component, out_dir, fixed_speech_length=None):
+def _convert_component(component, out_dir, fixed_speech_length=None, max_ctx=MAX_CTX):
     model = load_nano("cpu")
     t3 = model.t3
     conds = model.conds.gen
@@ -58,9 +58,9 @@ def _convert_component(component, out_dir, fixed_speech_length=None):
         states = None
         output_type = _tensor("inputs_embeds", None)
     elif component == "t3":
-        module = T3Stateful(t3).eval()
+        module = T3Stateful(t3, max_ctx=max_ctx).eval()
         l_dim = ct.RangeDim(1, 512, default=16)
-        s_dim = ct.RangeDim(1, MAX_CTX, default=16)
+        s_dim = ct.RangeDim(1, max_ctx, default=16)
         input_types = [
             _tensor("inputs_embeds", (1, l_dim, 768), np.float32),
             _tensor("position_start", (1,), np.int32),
@@ -71,7 +71,13 @@ def _convert_component(component, out_dir, fixed_speech_length=None):
             torch.zeros((1,), dtype=torch.int32),
             torch.zeros((1, 1, 16, 16), dtype=torch.float32),
         )
-        state_shape = (t3.cfg.n_layer, 1, t3.cfg.n_head, MAX_CTX, t3.cfg.hidden_size // t3.cfg.n_head)
+        state_shape = (
+            t3.cfg.n_layer,
+            1,
+            t3.cfg.n_head,
+            max_ctx,
+            t3.cfg.hidden_size // t3.cfg.n_head,
+        )
         states = [
             ct.StateType(name="k_cache", wrapped_type=ct.TensorType(shape=state_shape)),
             ct.StateType(name="v_cache", wrapped_type=ct.TensorType(shape=state_shape)),
@@ -201,7 +207,12 @@ def _convert_component(component, out_dir, fixed_speech_length=None):
         compute_precision=ct.precision.FLOAT16,
         pass_pipeline=pass_pipeline,
     )
-    suffix = f"_{fixed_speech_length}" if fixed_speech_length is not None else ""
+    if fixed_speech_length is not None:
+        suffix = f"_{fixed_speech_length}"
+    elif component == "t3" and max_ctx != MAX_CTX:
+        suffix = f"_ctx{max_ctx}"
+    else:
+        suffix = ""
     fp16_path = out_dir / f"{component}{suffix}_fp16.mlpackage"
     converted.save(str(fp16_path))
     sizes = {"fp16_bytes": dir_size(fp16_path), "fp16": human(dir_size(fp16_path))}
@@ -295,6 +306,7 @@ def main():
     )
     parser.add_argument("--quantize-existing", action="store_true")
     parser.add_argument("--fixed-speech-length", type=int)
+    parser.add_argument("--max-ctx", type=int, default=MAX_CTX)
     args = parser.parse_args()
     out_dir = artifacts_dir()
     parity_path = out_dir / "parity.json"
@@ -309,11 +321,12 @@ def main():
     report = json.loads(report_path.read_text()) if report_path.exists() else {}
     for component in components:
         print(f"[convert] starting {component}")
-        report_key = (
-            f"{component}_{args.fixed_speech_length}"
-            if args.fixed_speech_length is not None
-            else component
-        )
+        if args.fixed_speech_length is not None:
+            report_key = f"{component}_{args.fixed_speech_length}"
+        elif component == "t3" and args.max_ctx != MAX_CTX:
+            report_key = f"{component}_ctx{args.max_ctx}"
+        else:
+            report_key = component
         try:
             if args.quantize_existing:
                 report[report_key] = {
@@ -323,7 +336,9 @@ def main():
             else:
                 report[report_key] = {
                     "status": "converted",
-                    "sizes": _convert_component(component, out_dir, args.fixed_speech_length),
+                    "sizes": _convert_component(
+                        component, out_dir, args.fixed_speech_length, args.max_ctx
+                    ),
                 }
             print(f"[convert] {component}: {report[report_key]['sizes']}")
         except Exception as exc:
