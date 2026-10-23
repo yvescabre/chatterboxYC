@@ -158,10 +158,11 @@ def _flow_reference(flow, token, conds, initial_noise, noised_mels):
 
 
 def _flow_wrapped(flow_wrapper, token, conds, initial_noise, noised_mels):
+    token_len = conds["prompt_token_len"] + token.shape[1]
     return flow_wrapper(
         token,
+        token_len,
         conds["prompt_token"],
-        conds["prompt_token_len"],
         conds["prompt_feat"],
         conds["embedding"],
         initial_noise,

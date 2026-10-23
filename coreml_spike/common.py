@@ -17,6 +17,7 @@ LINES = [
 MAX_CTX = 1024
 MAX_TEXT_LEN = 512
 MAX_SPEECH_TOKENS = 600
+SPEECH_TOKEN_BUCKETS = (64, 128, 192)
 N_CFM_TIMESTEPS = 2
 HIFT_UPSAMPLE = 480  # prod(upsample_rates) * istft hop_len = 8*5*3*4
 

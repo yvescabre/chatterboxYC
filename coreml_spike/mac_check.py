@@ -10,7 +10,14 @@ import wave
 import coremltools as ct
 import numpy as np
 
-from coreml_spike.common import HIFT_UPSAMPLE, MAX_CTX, MAX_SPEECH_TOKENS, artifacts_dir, max_abs_err
+from coreml_spike.common import (
+    HIFT_UPSAMPLE,
+    MAX_CTX,
+    MAX_SPEECH_TOKENS,
+    SPEECH_TOKEN_BUCKETS,
+    artifacts_dir,
+    max_abs_err,
+)
 
 
 SPEECH_START = 6561
@@ -24,8 +31,9 @@ def _read_npz(name):
     return np.load(artifacts_dir() / name, allow_pickle=False)
 
 
-def _model(component, compute_units=ct.ComputeUnit.ALL, variant="fp16"):
-    path = artifacts_dir() / f"{component}_{variant}.mlpackage"
+def _model(component, compute_units=ct.ComputeUnit.ALL, variant="fp16", speech_length=None):
+    suffix = f"_{speech_length}" if speech_length is not None else ""
+    path = artifacts_dir() / f"{component}{suffix}_{variant}.mlpackage"
     return ct.models.MLModel(str(path), compute_units=compute_units)
 
 
@@ -44,6 +52,25 @@ def _numpy_mask(q_len, kv_len):
 
 def _as_f32(value):
     return np.asarray(value, dtype=np.float32)
+
+
+def _speech_bucket(token_count):
+    exact_lengths = set()
+    with _read_npz("flow_ref.npz") as refs:
+        exact_lengths.add(int(refs["token"].shape[1]))
+    for line in json.loads((artifacts_dir() / "tokenized_texts.json").read_text()):
+        with _read_npz(f"pipeline_line_{int(line['index'])}.npz") as refs:
+            exact_lengths.add(int(refs["speech_tokens"].shape[1]))
+    if token_count in exact_lengths:
+        return token_count
+    return next(size for size in SPEECH_TOKEN_BUCKETS if size >= token_count)
+
+
+def _pad_last_dim(value, target):
+    padding = target - value.shape[-1]
+    if padding < 0:
+        raise ValueError(f"cannot pad length {value.shape[-1]} to {target}")
+    return np.pad(value, [(0, 0)] * (value.ndim - 1) + [(0, padding)])
 
 
 def _timed_predict(component, package, inputs, repeats=5):
@@ -144,7 +171,7 @@ def check_references(variant="fp16"):
     cases = {
         "prefix": ("t3_prefix_ref.npz", ["text_tokens", "speaker_emb", "cond_prompt_speech_tokens"], "inputs_embeds", "inputs_embeds"),
         "t3": ("t3_stateful_ref.npz", ["inputs_embeds", "position_start", "causal_mask"], "speech_logits", "speech_logits"),
-        "flow": ("flow_ref.npz", ["token", "prompt_token", "prompt_token_len", "prompt_feat", "embedding", "initial_noise", "noise"], "mel", "mel"),
+        "flow": ("flow_ref.npz", ["token", "prompt_token", "prompt_feat", "embedding", "initial_noise", "noise"], "mel", "mel"),
         "hift": ("hift_ref.npz", ["mel", "phase", "sine_noise", "src_noise"], "wav", "wav"),
     }
     results = {}
@@ -158,8 +185,31 @@ def check_references(variant="fp16"):
         if component == "flow":
             inputs["token"] = np.asarray(inputs["token"], dtype=np.int32)
             inputs["prompt_token"] = np.asarray(inputs["prompt_token"], dtype=np.int32)
-            inputs["prompt_token_len"] = np.asarray(inputs["prompt_token_len"], dtype=np.int32)
-        package = _model(component, variant=variant)
+            token_count = inputs["token"].shape[1]
+            bucket = _speech_bucket(token_count)
+            prompt_token_len = np.asarray(refs["prompt_token_len"], dtype=np.int32)
+            inputs["token_len"] = prompt_token_len + token_count
+            inputs["token"] = np.pad(
+                inputs["token"],
+                ((0, 0), (0, bucket - token_count)),
+                constant_values=S3GEN_SIL,
+            )
+            inputs["initial_noise"] = _pad_last_dim(
+                inputs["initial_noise"], inputs["initial_noise"].shape[-1] + 2 * (bucket - token_count)
+            )
+            inputs["noise"] = _pad_last_dim(inputs["noise"], 2 * bucket)
+        if component == "hift":
+            token_count = _speech_bucket(refs["mel"].shape[-1] // 2)
+            inputs["mel"] = _pad_last_dim(inputs["mel"], 2 * token_count)
+            samples = 2 * token_count * HIFT_UPSAMPLE
+            inputs["sine_noise"] = _pad_last_dim(inputs["sine_noise"], samples)
+            inputs["src_noise"] = _pad_last_dim(inputs["src_noise"], samples)
+        shape_length = _speech_bucket(
+            inputs["token"].shape[1]
+            if component == "flow"
+            else refs["mel"].shape[-1] // 2
+        ) if component in ("flow", "hift") else None
+        package = _model(component, variant=variant, speech_length=shape_length)
         inputs = _filter_inputs(package, inputs)
         if component == "t3":
             predicted, state = _stateful_predict(package, inputs)
@@ -187,14 +237,28 @@ def check_references(variant="fp16"):
             }
         else:
             predicted = package.predict(inputs)
-            error = max_abs_err(predicted[output_name], refs[expected_name])
+            actual = predicted[output_name]
+            if component == "flow":
+                actual = actual[:, :, : refs[expected_name].shape[-1]]
+            elif component == "hift":
+                actual = actual[:, : refs[expected_name].shape[-1]]
+            error = max_abs_err(actual, refs[expected_name])
             results[component] = {"max_abs_error": error}
         print(f"[reference] {component}: max_abs_error={error:.9g}")
 
         latency = {}
-        for label, unit in (("ALL", ct.ComputeUnit.ALL), ("CPU_ONLY", ct.ComputeUnit.CPU_ONLY)):
+        units = (
+            ("ALL", ct.ComputeUnit.ALL),
+            ("CPU_AND_GPU", ct.ComputeUnit.CPU_AND_GPU),
+            ("CPU_AND_NE", ct.ComputeUnit.CPU_AND_NE),
+            ("CPU_ONLY", ct.ComputeUnit.CPU_ONLY),
+        )
+        for label, unit in units:
             runner = package if label == "ALL" else _model(
-                component, compute_units=unit, variant=variant
+                component,
+                compute_units=unit,
+                variant=variant,
+                speech_length=shape_length,
             )
             latency[label] = _timed_predict(component, runner, inputs, repeats=5)
             print(f"[latency] {component} {label}: median={latency[label]:.6f}s (5 runs)")
@@ -211,8 +275,6 @@ def run_pipeline(variant="fp16"):
     tokenized = json.loads((out_dir / "tokenized_texts.json").read_text())
     prefix_model = _model("prefix", variant=variant)
     t3_model = _model("t3", variant=variant)
-    flow_model = _model("flow", variant=variant)
-    hift_model = _model("hift", variant=variant)
     rng = np.random.default_rng(0)
 
     cond_prompt = np.asarray(conds["t3_prompt_speech_tokens"], dtype=np.int32)
@@ -240,26 +302,39 @@ def run_pipeline(variant="fp16"):
         speech_tokens = np.asarray([valid + [S3GEN_SIL] * 3], dtype=np.int32)
         out_len = speech_tokens.shape[1] * 2
         prompt_frames = gen_prompt_feat.shape[1]
+        bucket = _speech_bucket(speech_tokens.shape[1])
+        flow_model = _model("flow", variant=variant, speech_length=bucket)
+        padded_tokens = np.pad(
+            speech_tokens,
+            ((0, 0), (0, bucket - speech_tokens.shape[1])),
+            constant_values=S3GEN_SIL,
+        )
         flow_inputs = {
-            "token": speech_tokens,
+            "token": padded_tokens,
             "prompt_token": gen_prompt_token,
-            "prompt_token_len": gen_prompt_token_len,
+            "token_len": gen_prompt_token_len + speech_tokens.shape[1],
             "prompt_feat": gen_prompt_feat,
             "embedding": gen_embedding,
-            "initial_noise": rng.standard_normal((1, 80, prompt_frames + out_len), dtype=np.float32),
-            "noise": rng.standard_normal((1, 80, out_len), dtype=np.float32),
+            "initial_noise": rng.standard_normal(
+                (1, 80, prompt_frames + 2 * bucket), dtype=np.float32
+            ),
+            "noise": rng.standard_normal((1, 80, 2 * bucket), dtype=np.float32),
         }
-        mel = flow_model.predict(flow_inputs)["mel"]
+        mel = flow_model.predict(flow_inputs)["mel"][:, :, :out_len]
         with _read_npz("hift_ref.npz") as hift_refs:
             hcount = int(hift_refs["phase"].shape[1])
-        samples = mel.shape[-1] * HIFT_UPSAMPLE
+        mel_for_hift = _pad_last_dim(mel, 2 * bucket)
+        samples = mel_for_hift.shape[-1] * HIFT_UPSAMPLE
+        hift_model = _model("hift", variant=variant, speech_length=bucket)
         hift_inputs = {
-            "mel": _as_f32(mel),
+            "mel": _as_f32(mel_for_hift),
             "phase": rng.uniform(-np.pi, np.pi, size=(1, hcount, 1)).astype(np.float32),
             "sine_noise": rng.standard_normal((1, hcount, samples), dtype=np.float32),
             "src_noise": rng.standard_normal((1, 1, samples), dtype=np.float32),
         }
-        wav = hift_model.predict(_filter_inputs(hift_model, hift_inputs))["wav"][0]
+        wav = hift_model.predict(_filter_inputs(hift_model, hift_inputs))["wav"][
+            0, : out_len * HIFT_UPSAMPLE
+        ]
         wav_path = out_dir / f"mac_{index}.wav"
         _write_wav(wav_path, wav)
         elapsed = time.perf_counter() - t0

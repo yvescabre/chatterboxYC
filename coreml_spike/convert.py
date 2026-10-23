@@ -16,9 +16,9 @@ from coremltools.optimize.coreml._config import CompressionGranularity
 from coreml_spike.common import (
     HIFT_UPSAMPLE,
     MAX_CTX,
-    MAX_SPEECH_TOKENS,
     MAX_TEXT_LEN,
     N_CFM_TIMESTEPS,
+    SPEECH_TOKEN_BUCKETS,
     artifacts_dir,
     dir_size,
     human,
@@ -37,7 +37,7 @@ def _tensor(name, shape, dtype=None):
     return ct.TensorType(name=name, shape=shape, dtype=dtype)
 
 
-def _convert_component(component, out_dir):
+def _convert_component(component, out_dir, fixed_speech_length=None):
     model = load_nano("cpu")
     t3 = model.t3
     conds = model.conds.gen
@@ -79,47 +79,106 @@ def _convert_component(component, out_dir):
         output_type = _tensor("speech_logits", None)
     elif component == "flow":
         module = FlowWrapper(model.s3gen.flow, N_CFM_TIMESTEPS).eval()
-        token_len = ct.RangeDim(1, MAX_SPEECH_TOKENS, default=3)
-        prompt_len = ct.RangeDim(1, 600, default=int(conds["prompt_token"].shape[1]))
-        feat_len = ct.RangeDim(1, 1200, default=int(conds["prompt_feat"].shape[1]))
-        all_frames = ct.RangeDim(2, 2400, default=int(conds["prompt_feat"].shape[1] + 6))
-        gen_frames = ct.RangeDim(2, 1200, default=6)
+        prompt_len = int(conds["prompt_token"].shape[1])
+        feat_len = int(conds["prompt_feat"].shape[1])
+        speech_lengths = set(SPEECH_TOKEN_BUCKETS)
+        with np.load(out_dir / "flow_ref.npz", allow_pickle=False) as refs:
+            speech_lengths.add(int(refs["token"].shape[1]))
+        for index in range(3):
+            with np.load(out_dir / f"pipeline_line_{index}.npz", allow_pickle=False) as refs:
+                speech_lengths.add(int(refs["speech_tokens"].shape[1]))
+        speech_lengths = (
+            (fixed_speech_length,)
+            if fixed_speech_length is not None
+            else tuple(sorted(speech_lengths))
+        )
+        token_shapes = [(1, length) for length in speech_lengths]
+        initial_noise_shapes = [
+            (1, 80, feat_len + 2 * length) for length in speech_lengths
+        ]
+        noise_shapes = [(1, 80, 2 * length) for length in speech_lengths]
         input_types = [
-            _tensor("token", (1, token_len), np.int32),
+            _tensor(
+                "token",
+                token_shapes[0] if fixed_speech_length is not None else ct.EnumeratedShapes(token_shapes),
+                np.int32,
+            ),
+            _tensor("token_len", (1,), np.int32),
             _tensor("prompt_token", (1, prompt_len), np.int32),
-            _tensor("prompt_token_len", (1,), np.int32),
             _tensor("prompt_feat", (1, feat_len, 80), np.float32),
             _tensor("embedding", (1, 192), np.float32),
-            _tensor("initial_noise", (1, 80, all_frames), np.float32),
-            _tensor("noise", (1, 80, gen_frames), np.float32),
+            _tensor(
+                "initial_noise",
+                initial_noise_shapes[0]
+                if fixed_speech_length is not None
+                else ct.EnumeratedShapes(initial_noise_shapes),
+                np.float32,
+            ),
+            _tensor(
+                "noise",
+                noise_shapes[0]
+                if fixed_speech_length is not None
+                else ct.EnumeratedShapes(noise_shapes),
+                np.float32,
+            ),
         ]
+        example_tokens = speech_lengths[0]
         example_inputs = (
-            torch.ones((1, 3), dtype=torch.int32),
+            torch.full((1, example_tokens), 4299, dtype=torch.int32),
+            conds["prompt_token_len"].int() + example_tokens,
             conds["prompt_token"].long(),
-            conds["prompt_token_len"].int(),
             conds["prompt_feat"].float(),
             conds["embedding"].float(),
-            torch.zeros((1, 80, 506), dtype=torch.float32),
-            torch.zeros((1, 80, 6), dtype=torch.float32),
+            torch.zeros((1, 80, feat_len + 2 * example_tokens), dtype=torch.float32),
+            torch.zeros((1, 80, 2 * example_tokens), dtype=torch.float32),
         )
         states = None
         output_type = _tensor("mel", None)
     elif component == "hift":
         module = HiFTWrapper(model.s3gen.mel2wav).eval()
-        mel_len = ct.RangeDim(1, MAX_SPEECH_TOKENS * 2, default=6)
-        sample_len = ct.RangeDim(HIFT_UPSAMPLE, MAX_SPEECH_TOKENS * 2 * HIFT_UPSAMPLE, default=6 * HIFT_UPSAMPLE)
         harmonics = model.s3gen.mel2wav.nb_harmonics + 1
-        input_types = [
-            _tensor("mel", (1, 80, mel_len), np.float32),
-            _tensor("phase", (1, harmonics, 1), np.float32),
-            _tensor("sine_noise", (1, harmonics, sample_len), np.float32),
-            _tensor("src_noise", (1, 1, sample_len), np.float32),
+        speech_lengths = set(SPEECH_TOKEN_BUCKETS)
+        with np.load(out_dir / "flow_ref.npz", allow_pickle=False) as refs:
+            speech_lengths.add(int(refs["token"].shape[1]))
+        for index in range(3):
+            with np.load(out_dir / f"pipeline_line_{index}.npz", allow_pickle=False) as refs:
+                speech_lengths.add(int(refs["speech_tokens"].shape[1]))
+        speech_lengths = (
+            (fixed_speech_length,)
+            if fixed_speech_length is not None
+            else tuple(sorted(speech_lengths))
+        )
+        mel_shapes = [(1, 80, 2 * length) for length in speech_lengths]
+        sample_shapes = [
+            (1, harmonics, 2 * length * HIFT_UPSAMPLE) for length in speech_lengths
         ]
+        input_types = [
+            _tensor(
+                "mel",
+                mel_shapes[0] if fixed_speech_length is not None else ct.EnumeratedShapes(mel_shapes),
+                np.float32,
+            ),
+            _tensor("phase", (1, harmonics, 1), np.float32),
+            _tensor(
+                "sine_noise",
+                sample_shapes[0] if fixed_speech_length is not None else ct.EnumeratedShapes(sample_shapes),
+                np.float32,
+            ),
+            _tensor(
+                "src_noise",
+                (1, 1, sample_shapes[0][-1])
+                if fixed_speech_length is not None
+                else ct.EnumeratedShapes([(1, 1, shape[-1]) for shape in sample_shapes]),
+                np.float32,
+            ),
+        ]
+        example_frames = 2 * speech_lengths[0]
+        example_samples = example_frames * HIFT_UPSAMPLE
         example_inputs = (
-            torch.zeros((1, 80, 6), dtype=torch.float32),
+            torch.zeros((1, 80, example_frames), dtype=torch.float32),
             torch.zeros((1, harmonics, 1), dtype=torch.float32),
-            torch.zeros((1, harmonics, 6 * HIFT_UPSAMPLE), dtype=torch.float32),
-            torch.zeros((1, 1, 6 * HIFT_UPSAMPLE), dtype=torch.float32),
+            torch.zeros((1, harmonics, example_samples), dtype=torch.float32),
+            torch.zeros((1, 1, example_samples), dtype=torch.float32),
         )
         states = None
         output_type = _tensor("wav", None)
@@ -137,7 +196,8 @@ def _convert_component(component, out_dir):
         minimum_deployment_target=ct.target.iOS18,
         compute_precision=ct.precision.FLOAT16,
     )
-    fp16_path = out_dir / f"{component}_fp16.mlpackage"
+    suffix = f"_{fixed_speech_length}" if fixed_speech_length is not None else ""
+    fp16_path = out_dir / f"{component}{suffix}_fp16.mlpackage"
     converted.save(str(fp16_path))
     sizes = {"fp16_bytes": dir_size(fp16_path), "fp16": human(dir_size(fp16_path))}
 
@@ -150,7 +210,7 @@ def _convert_component(component, out_dir):
             )
         )
         quantized = ct.optimize.coreml.linear_quantize_weights(converted, linear_config)
-        int8_path = out_dir / f"{component}_int8.mlpackage"
+        int8_path = out_dir / f"{component}{suffix}_int8.mlpackage"
         quantized.save(str(int8_path))
         sizes["int8_bytes"] = dir_size(int8_path)
         sizes["int8"] = human(sizes["int8_bytes"])
@@ -168,7 +228,7 @@ def _convert_component(component, out_dir):
             )
         )
         palettized = ct.optimize.coreml.palettize_weights(converted, palette_config)
-        palette_path = out_dir / f"{component}_6bit.mlpackage"
+        palette_path = out_dir / f"{component}{suffix}_6bit.mlpackage"
         palettized.save(str(palette_path))
         sizes["6bit_bytes"] = dir_size(palette_path)
         sizes["6bit"] = human(sizes["6bit_bytes"])
@@ -181,12 +241,13 @@ def _convert_component(component, out_dir):
     return sizes
 
 
-def _quantize_existing(component, out_dir):
-    fp16_path = out_dir / f"{component}_fp16.mlpackage"
+def _quantize_existing(component, out_dir, fixed_speech_length=None):
+    suffix = f"_{fixed_speech_length}" if fixed_speech_length is not None else ""
+    fp16_path = out_dir / f"{component}{suffix}_fp16.mlpackage"
     model = ct.models.MLModel(str(fp16_path), skip_model_load=True)
     sizes = {"fp16_bytes": dir_size(fp16_path), "fp16": human(dir_size(fp16_path))}
     try:
-        path = out_dir / f"{component}_int8.mlpackage"
+        path = out_dir / f"{component}{suffix}_int8.mlpackage"
         if not path.exists():
             config = ct.optimize.coreml.OptimizationConfig(
                 global_config=ct.optimize.coreml.OpLinearQuantizerConfig(
@@ -210,7 +271,7 @@ def _quantize_existing(component, out_dir):
             )
         )
         palettized = ct.optimize.coreml.palettize_weights(model, config)
-        path = out_dir / f"{component}_6bit.mlpackage"
+        path = out_dir / f"{component}{suffix}_6bit.mlpackage"
         palettized.save(str(path))
         sizes["6bit_bytes"] = dir_size(path)
         sizes["6bit"] = human(sizes["6bit_bytes"])
@@ -228,6 +289,7 @@ def main():
         default="all",
     )
     parser.add_argument("--quantize-existing", action="store_true")
+    parser.add_argument("--fixed-speech-length", type=int)
     args = parser.parse_args()
     out_dir = artifacts_dir()
     parity_path = out_dir / "parity.json"
@@ -242,14 +304,25 @@ def main():
     report = json.loads(report_path.read_text()) if report_path.exists() else {}
     for component in components:
         print(f"[convert] starting {component}")
+        report_key = (
+            f"{component}_{args.fixed_speech_length}"
+            if args.fixed_speech_length is not None
+            else component
+        )
         try:
             if args.quantize_existing:
-                report[component] = {"status": "converted", "sizes": _quantize_existing(component, out_dir)}
+                report[report_key] = {
+                    "status": "converted",
+                    "sizes": _quantize_existing(component, out_dir, args.fixed_speech_length),
+                }
             else:
-                report[component] = {"status": "converted", "sizes": _convert_component(component, out_dir)}
-            print(f"[convert] {component}: {report[component]['sizes']}")
+                report[report_key] = {
+                    "status": "converted",
+                    "sizes": _convert_component(component, out_dir, args.fixed_speech_length),
+                }
+            print(f"[convert] {component}: {report[report_key]['sizes']}")
         except Exception as exc:
-            report[component] = {
+            report[report_key] = {
                 "status": "blocked",
                 "error_type": type(exc).__name__,
                 "error": str(exc),

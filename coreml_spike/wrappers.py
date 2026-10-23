@@ -12,6 +12,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from chatterbox.models.s3gen.utils.mask import make_pad_mask
+
 from .common import HIFT_UPSAMPLE, MAX_CTX, N_CFM_TIMESTEPS
 
 
@@ -130,7 +132,7 @@ class FlowWrapper(nn.Module):
     inputs
       token        [1, T]            int32, generated speech tokens (prompt excluded)
       prompt_token [1, Tp]           int32, from conds.gen
-      prompt_token_len [1]           int32, from conds.gen
+      token_len        [1]           int32, valid prompt + generated-token length
       prompt_feat  [1, 2*Tp, 80]     from conds.gen
       embedding    [1, 192]          speaker x-vector from conds.gen
       initial_noise [1, 80, 2*(Tp+T)] CFM latent noise before noised-mel replacement
@@ -146,15 +148,15 @@ class FlowWrapper(nn.Module):
         t_span = torch.linspace(0, 1, n_timesteps + 1)
         self.register_buffer("t_span", t_span)
 
-    def forward(self, token, prompt_token, prompt_token_len, prompt_feat, embedding, initial_noise, noise):
+    def forward(self, token, token_len, prompt_token, prompt_feat, embedding, initial_noise, noise):
         flow = self.flow
         embedding = F.normalize(embedding, dim=1)
         embedding = flow.spk_embed_affine_layer(embedding)
 
         tokens = torch.cat([prompt_token.long(), token.long()], dim=1)
-        n_tok = tokens.shape[1]
-        token_len = prompt_token_len.long() + (tokens.shape[1] - prompt_token.shape[1])
-        emb = flow.input_embedding(tokens)
+        token_len = token_len.long()
+        token_mask = (~make_pad_mask(token_len, tokens.shape[1])).unsqueeze(-1).to(embedding)
+        emb = flow.input_embedding(tokens) * token_mask
 
         h, h_masks = flow.encoder(emb, token_len)
         h = flow.encoder_proj(h)
