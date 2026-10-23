@@ -1,0 +1,10 @@
+# Spike artifacts live in ~/nano-spike/coreml, never in git.
+*.mlpackage/
+*.mlmodelc/
+*.npz
+*.npy
+*.wav
+*.pt
+*.json
+__pycache__/
+*.py[cod]
